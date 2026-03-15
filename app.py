@@ -7,6 +7,7 @@ import yfinance as yf
 import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
+import time
 
 # ── 1. App Configuration ──────────────────────────────────────────────────────
 st.set_page_config(page_title="HaiInvestor", page_icon="👋", layout="wide")
@@ -138,34 +139,44 @@ def fmt_val(val, suffix="", multiplier=1, decimals=2):
     if suffix == "" and abs(v) >= 1e6:  return f"${v/1e6:.1f}M"
     return f"{v:.{decimals}f}{suffix}"
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=600)
 def fetch_price_and_fundamentals(ticker):
-    """Returns (price_dict, fundamentals_dict) or raises. Cached for 5 min."""
-    tkr  = yf.Ticker(ticker)
-    hist = tkr.history(period="5d")
-    if hist.empty:
-        raise ValueError("No price data")
-    price = {
-        "current":  float(hist["Close"].iloc[-1]),
-        "prev":     float(hist["Close"].iloc[-2]) if len(hist) >= 2 else float(hist["Close"].iloc[-1]),
-        "high":     float(hist["High"].iloc[-1]),
-        "low":      float(hist["Low"].iloc[-1]),
-    }
-    price["change"]     = price["current"] - price["prev"]
-    price["change_pct"] = price["change"] / price["prev"] * 100
+    """Returns (price_dict, fundamentals_dict) or raises. Cached for 10 min."""
+    last_exc = None
+    for attempt in range(3):
+        try:
+            tkr  = yf.Ticker(ticker)
+            hist = tkr.history(period="5d")
+            if hist.empty:
+                raise ValueError("No price data")
+            price = {
+                "current":  float(hist["Close"].iloc[-1]),
+                "prev":     float(hist["Close"].iloc[-2]) if len(hist) >= 2 else float(hist["Close"].iloc[-1]),
+                "high":     float(hist["High"].iloc[-1]),
+                "low":      float(hist["Low"].iloc[-1]),
+            }
+            price["change"]     = price["current"] - price["prev"]
+            price["change_pct"] = price["change"] / price["prev"] * 100
 
-    info = tkr.info
-    fund = {
-        "Market Cap":    fmt_val(info.get("marketCap")),
-        "P/E (TTM)":     fmt_val(info.get("trailingPE"),       decimals=1),
-        "Forward P/E":   fmt_val(info.get("forwardPE"),        decimals=1),
-        "P/B Ratio":     fmt_val(info.get("priceToBook"),      decimals=2),
-        "Revenue Growth":fmt_val(info.get("revenueGrowth"),    suffix="%", multiplier=100, decimals=1),
-        "Profit Margin": fmt_val(info.get("profitMargins"),    suffix="%", multiplier=100, decimals=1),
-        "ROE":           fmt_val(info.get("returnOnEquity"),   suffix="%", multiplier=100, decimals=1),
-        "Debt/Equity":   fmt_val(info.get("debtToEquity"),     decimals=2),
-    }
-    return price, fund
+            info = tkr.info
+            fund = {
+                "Market Cap":    fmt_val(info.get("marketCap")),
+                "P/E (TTM)":     fmt_val(info.get("trailingPE"),       decimals=1),
+                "Forward P/E":   fmt_val(info.get("forwardPE"),        decimals=1),
+                "P/B Ratio":     fmt_val(info.get("priceToBook"),      decimals=2),
+                "Revenue Growth":fmt_val(info.get("revenueGrowth"),    suffix="%", multiplier=100, decimals=1),
+                "Profit Margin": fmt_val(info.get("profitMargins"),    suffix="%", multiplier=100, decimals=1),
+                "ROE":           fmt_val(info.get("returnOnEquity"),   suffix="%", multiplier=100, decimals=1),
+                "Debt/Equity":   fmt_val(info.get("debtToEquity"),     decimals=2),
+            }
+            return price, fund
+        except Exception as e:
+            last_exc = e
+            if "429" in str(e) or "Too Many" in str(e) or "Rate" in str(e):
+                time.sleep(2 ** attempt)  # 1s → 2s → 4s
+                continue
+            raise
+    raise last_exc
 
 @st.cache_data(ttl=3600)
 def search_ticker(query):
@@ -184,9 +195,17 @@ def search_ticker(query):
     except Exception:
         return []
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=600)
 def fetch_chart_history(ticker, period="6mo"):
-    return yf.Ticker(ticker).history(period=period)
+    for attempt in range(3):
+        try:
+            return yf.Ticker(ticker).history(period=period)
+        except Exception as e:
+            if "429" in str(e) or "Too Many" in str(e) or "Rate" in str(e):
+                time.sleep(2 ** attempt)
+                continue
+            raise
+    return pd.DataFrame()
 
 @st.cache_data(ttl=300)
 def fetch_news(ticker):
