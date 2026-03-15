@@ -6,7 +6,7 @@ import json
 import yfinance as yf
 
 # ── 1. App Configuration ──────────────────────────────────────────────────────
-st.set_page_config(page_title="AInvest", page_icon="📈", layout="wide")
+st.set_page_config(page_title="HaiInvestor", page_icon="👋", layout="wide")
 
 st.markdown("""
 <style>
@@ -130,8 +130,8 @@ except Exception:
 # ── 3. Header ─────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="app-header">
-    <h1>📈 AInvest Panel</h1>
-    <p>6 legendary AI investors debate your stock — powered by real news & live prices</p>
+    <h1>👋 HaiInvestor</h1>
+    <p>New to investing? Just pick a stock — 6 legendary AI investors will debate it for you.</p>
 </div>
 """, unsafe_allow_html=True)
 
