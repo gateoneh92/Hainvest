@@ -124,8 +124,9 @@ def fmt_val(val, suffix="", multiplier=1, decimals=2):
     if suffix == "" and abs(v) >= 1e6:  return f"${v/1e6:.1f}M"
     return f"{v:.{decimals}f}{suffix}"
 
+@st.cache_data(ttl=300)
 def fetch_price_and_fundamentals(ticker):
-    """Returns (price_dict, fundamentals_dict, tkr) or raises."""
+    """Returns (price_dict, fundamentals_dict) or raises. Cached for 5 min."""
     tkr  = yf.Ticker(ticker)
     hist = tkr.history(period="5d")
     if hist.empty:
@@ -150,8 +151,13 @@ def fetch_price_and_fundamentals(ticker):
         "ROE":           fmt_val(info.get("returnOnEquity"),   suffix="%", multiplier=100, decimals=1),
         "Debt/Equity":   fmt_val(info.get("debtToEquity"),     decimals=2),
     }
-    return price, fund, tkr
+    return price, fund
 
+@st.cache_data(ttl=300)
+def fetch_chart_history(ticker, period="6mo"):
+    return yf.Ticker(ticker).history(period=period)
+
+@st.cache_data(ttl=300)
 def fetch_news(ticker):
     url  = f"https://news.google.com/rss/search?q={ticker}+stock&hl=en-US&gl=US&ceid=US:en"
     resp = requests.get(url, timeout=10)
@@ -321,7 +327,7 @@ Pick any stock and let 6 legendary AI investors debate it using real news and fi
         st.markdown("---")
         with st.spinner(f"Fetching data for {target_ticker}..."):
             try:
-                price, fund, tkr = fetch_price_and_fundamentals(target_ticker)
+                price, fund = fetch_price_and_fundamentals(target_ticker)
             except Exception as e:
                 st.error(f"Could not fetch data: {e}")
                 st.stop()
@@ -330,7 +336,7 @@ Pick any stock and let 6 legendary AI investors debate it using real news and fi
 
         # ── Chart ────────────────────────────────────────────────────────────
         try:
-            hist_6m = tkr.history(period="6mo")
+            hist_6m = fetch_chart_history(target_ticker, "6mo")
             if not hist_6m.empty:
                 fig = go.Figure()
                 fig.add_trace(go.Candlestick(
@@ -412,7 +418,7 @@ Enter several stocks at once and the AI will analyze each one, then suggest how 
             for i, ticker in enumerate(tickers):
                 progress.progress((i) / len(tickers), text=f"Analyzing {ticker}...")
                 try:
-                    price, fund, _ = fetch_price_and_fundamentals(ticker)
+                    price, fund = fetch_price_and_fundamentals(ticker)
                     news = fetch_news(ticker)
                     # Lightweight single-signal prompt
                     fund_text = "\n".join(f"- {k}: {v}" for k, v in fund.items() if v != "N/A")
@@ -561,7 +567,11 @@ Each quarter, we check two things Warren Buffett, Peter Lynch, and others actual
                 tkr_bt = yf.Ticker(bt_ticker)
 
                 # ── Get quarterly financials ──────────────────────────────────
-                income = tkr_bt.quarterly_income_stmt
+                @st.cache_data(ttl=3600)
+                def get_quarterly_income(t):
+                    return yf.Ticker(t).quarterly_income_stmt
+
+                income = get_quarterly_income(bt_ticker)
                 if income is None or income.empty:
                     st.error("No quarterly financial data available for this ticker.")
                 else:
@@ -596,7 +606,7 @@ Each quarter, we check two things Warren Buffett, Peter Lynch, and others actual
                         signals_df["signal"] = signals_df["signal"].shift(1).fillna(0)
 
                         # ── Get daily price history ───────────────────────────
-                        hist_bt = tkr_bt.history(period=bt_period)[["Close"]].copy()
+                        hist_bt = fetch_chart_history(bt_ticker, bt_period)[["Close"]].copy()
                         if hist_bt.empty or len(hist_bt) < 20:
                             st.error("Not enough price history.")
                         else:
