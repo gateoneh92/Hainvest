@@ -279,6 +279,30 @@ def render_verdict(result):
 # TAB 1 — SINGLE STOCK
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab1:
+    with st.expander("❓ How does this work? (Click to read)"):
+        st.markdown("""
+**📊 Single Stock — Analyze one stock with 6 AI investors**
+
+Pick any stock and let 6 legendary AI investors debate it using real news and financial data.
+
+**How to use**
+1. Click one of the quick buttons (AAPL, NVDA, etc.) or type any ticker in the search box.
+2. The AI will analyze the latest news and real financial data, then each investor gives their opinion.
+
+**How to read the results**
+| Element | What it means |
+|---------|---------------|
+| Price bar | Current price, today's change, day high/low |
+| Fundamentals cards | Key numbers: P/E ratio, market cap, revenue growth, etc. |
+| Candlestick chart | 6-month price history |
+| BULLISH 🟢 | This investor thinks the stock will go **up** |
+| BEARISH 🔴 | This investor thinks the stock will go **down** |
+| NEUTRAL 🟡 | This investor is **unsure** |
+| Conviction % | How confident the AI is — higher means a stronger opinion |
+| BUY / SELL / HOLD | Final verdict: buy it / sell it / wait |
+
+> ⚠️ This is AI-generated analysis for educational purposes only. Always make your own investment decisions.
+""")
     st.markdown("#### 🔥 Popular Stocks")
     c1, c2, c3, c4, c5 = st.columns(5)
     target_ticker = None
@@ -345,6 +369,28 @@ with tab1:
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab2:
     st.markdown("### 💼 Portfolio Analyzer")
+    with st.expander("❓ How does this work? (Click to read)"):
+        st.markdown("""
+**💼 Portfolio — Compare and allocate across multiple stocks**
+
+Enter several stocks at once and the AI will analyze each one, then suggest how to split your investment between them.
+
+**How to use**
+1. Type up to 6 ticker symbols separated by commas — e.g. `AAPL, NVDA, TSLA`
+2. Click **Analyze Portfolio** and the AI will evaluate each stock.
+
+**How to read the results**
+| Element | What it means |
+|---------|---------------|
+| BUY / SELL / HOLD | AI's final opinion on each stock |
+| Conviction % | How confident the AI is — higher = stronger opinion |
+| Weight | Suggested allocation % among BULLISH stocks only |
+| Pie chart | Visual breakdown of the suggested allocation |
+
+**Example:** If AAPL gets 70% and NVDA gets 30%, a $1,000 portfolio would put $700 in AAPL and $300 in NVDA.
+
+> ⚠️ Weights are calculated automatically from AI conviction scores. Use as a reference only, not as financial advice.
+""")
     st.caption("Enter multiple tickers to get AI signals for each and suggested portfolio weights.")
 
     portfolio_input = st.text_input(
@@ -465,14 +511,46 @@ Return JSON: {{"signal": "BULLISH|BEARISH|NEUTRAL", "confidence": <1-100>, "summ
 # TAB 3 — BACKTEST
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab3:
-    st.markdown("### 📈 Strategy Backtest")
-    st.caption("Simulates a SMA(20/50) crossover strategy vs. Buy & Hold over the selected period.")
+    st.markdown("### 📈 AI Signal Backtest")
+    with st.expander("❓ How does this work? (Click to read)"):
+        st.markdown("""
+**📈 AI Signal Backtest — What if you followed the AI's logic historically?**
+
+This simulates what would have happened if you invested based on the same fundamentals our AI panel looks at — every quarter, for the past 1–5 years.
+
+**How to use**
+1. Enter a ticker symbol (e.g. `NVDA`)
+2. Select a time period (1 year / 2 years / 5 years)
+3. Click **Run Backtest**
+
+**How the signal is generated (same logic as our AI investors)**
+Each quarter, we check two things Warren Buffett, Peter Lynch, and others actually care about:
+- 📈 Is revenue **growing** compared to last quarter?
+- 💰 Is the company **profitable** (positive profit margin)?
+
+| Condition | Signal |
+|-----------|--------|
+| Revenue growing AND profitable | 🟢 BULLISH → Buy |
+| Revenue shrinking OR losing money | 🔴 BEARISH → Sell |
+| Mixed signals | 🟡 NEUTRAL → Hold cash |
+
+**How to read the results**
+| Metric | What it means |
+|--------|---------------|
+| AI Signal Return | Return if you followed the fundamental signals |
+| Buy & Hold Return | Return if you just bought and never sold |
+| Max Drawdown | Worst loss from peak — smaller is better |
+| Quarters Invested | How many quarters the signal said "hold the stock" |
+
+> ⚠️ Past performance does not guarantee future results. For educational purposes only.
+""")
+    st.caption("Simulates returns based on quarterly fundamental signals — the same logic our AI investors use.")
 
     bt_col1, bt_col2, bt_col3 = st.columns([2, 1, 1])
     with bt_col1:
         bt_ticker = st.text_input("Ticker", value="NVDA", key="bt_ticker").upper().strip()
     with bt_col2:
-        bt_period = st.selectbox("Period", ["6mo", "1y", "2y", "5y"], index=1)
+        bt_period = st.selectbox("Period", ["1y", "2y", "5y"], index=1)
     with bt_col3:
         st.markdown("<br>", unsafe_allow_html=True)
         run_bt = st.button("▶ Run Backtest", use_container_width=True)
@@ -481,76 +559,122 @@ with tab3:
         with st.spinner("Running backtest..."):
             try:
                 tkr_bt = yf.Ticker(bt_ticker)
-                df     = tkr_bt.history(period=bt_period)[["Close", "Volume"]].copy()
-                if df.empty or len(df) < 60:
-                    st.error("Not enough data for backtest.")
+
+                # ── Get quarterly financials ──────────────────────────────────
+                income = tkr_bt.quarterly_income_stmt
+                if income is None or income.empty:
+                    st.error("No quarterly financial data available for this ticker.")
                 else:
-                    df["SMA20"] = df["Close"].rolling(20).mean()
-                    df["SMA50"] = df["Close"].rolling(50).mean()
-                    df = df.dropna()
+                    # Revenue and net income rows
+                    rev_row = next((r for r in ["Total Revenue", "Revenue"] if r in income.index), None)
+                    inc_row = next((r for r in ["Net Income", "Net Income Common Stockholders"] if r in income.index), None)
 
-                    # Signal: 1 when SMA20 > SMA50, else 0 (shifted by 1 to avoid lookahead)
-                    df["signal"]   = (df["SMA20"] > df["SMA50"]).astype(int).shift(1).fillna(0)
-                    df["ret"]      = df["Close"].pct_change()
-                    df["strat"]    = df["signal"] * df["ret"]
+                    if not rev_row:
+                        st.error("Revenue data not available for this ticker.")
+                    else:
+                        rev = income.loc[rev_row].sort_index()           # oldest → newest
+                        net = income.loc[inc_row].sort_index() if inc_row else None
 
-                    df["bah_cum"]   = (1 + df["ret"]).cumprod()
-                    df["strat_cum"] = (1 + df["strat"]).cumprod()
+                        # Build quarterly signal DataFrame
+                        signals_df = pd.DataFrame({"revenue": rev})
+                        signals_df["rev_growth"] = signals_df["revenue"].pct_change()
+                        if net is not None:
+                            signals_df["profitable"] = net.reindex(signals_df.index) > 0
+                        else:
+                            signals_df["profitable"] = True  # assume if unknown
 
-                    # ── Stats ────────────────────────────────────────────────
-                    bah_ret   = (df["bah_cum"].iloc[-1] - 1) * 100
-                    strat_ret = (df["strat_cum"].iloc[-1] - 1) * 100
+                        def quarter_signal(row):
+                            if pd.isna(row["rev_growth"]): return 0
+                            growing    = row["rev_growth"] > 0
+                            profitable = row.get("profitable", True)
+                            if growing and profitable:   return 1   # BULLISH
+                            if not growing:              return 0   # BEARISH
+                            return 0.5                              # NEUTRAL → half position
 
-                    rolling_max  = df["strat_cum"].cummax()
-                    drawdown     = (df["strat_cum"] - rolling_max) / rolling_max
-                    max_dd       = drawdown.min() * 100
+                        signals_df["signal"] = signals_df.apply(quarter_signal, axis=1)
+                        # Shift by 1 quarter: we act on the quarter AFTER we see the data
+                        signals_df["signal"] = signals_df["signal"].shift(1).fillna(0)
 
-                    win_days = (df["strat"] > 0).sum()
-                    tot_days = (df["signal"] == 1).sum()
-                    win_rate = win_days / tot_days * 100 if tot_days > 0 else 0
+                        # ── Get daily price history ───────────────────────────
+                        hist_bt = tkr_bt.history(period=bt_period)[["Close"]].copy()
+                        if hist_bt.empty or len(hist_bt) < 20:
+                            st.error("Not enough price history.")
+                        else:
+                            # Map quarterly signal to daily
+                            hist_bt.index = hist_bt.index.tz_localize(None)
+                            signals_df.index = pd.to_datetime(signals_df.index).tz_localize(None)
 
-                    # ── Metrics row ──────────────────────────────────────────
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Strategy Return", f"{strat_ret:+.1f}%")
-                    m2.metric("Buy & Hold Return", f"{bah_ret:+.1f}%")
-                    m3.metric("Max Drawdown", f"{max_dd:.1f}%")
-                    m4.metric("Win Rate (in-market)", f"{win_rate:.1f}%")
+                            hist_bt["signal"] = 0.0
+                            for date, sig in signals_df["signal"].items():
+                                mask = hist_bt.index >= date
+                                hist_bt.loc[mask, "signal"] = sig
 
-                    # ── Chart ────────────────────────────────────────────────
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(
-                        x=df.index, y=df["bah_cum"],
-                        name="Buy & Hold", line=dict(color="#aaa", width=1.5, dash="dot"),
-                    ))
-                    fig.add_trace(go.Scatter(
-                        x=df.index, y=df["strat_cum"],
-                        name="SMA Strategy", line=dict(color="#00e676", width=2),
-                        fill="tozeroy", fillcolor="rgba(0,230,118,0.05)",
-                    ))
-                    # SMA lines on secondary
-                    fig.add_trace(go.Scatter(
-                        x=df.index, y=df["SMA20"] / df["Close"].iloc[0],
-                        name="SMA20 (norm)", line=dict(color="#0079C1", width=1), visible="legendonly",
-                    ))
-                    fig.add_trace(go.Scatter(
-                        x=df.index, y=df["SMA50"] / df["Close"].iloc[0],
-                        name="SMA50 (norm)", line=dict(color="#ffd740", width=1), visible="legendonly",
-                    ))
-                    fig.update_layout(
-                        paper_bgcolor="#16213e", plot_bgcolor="#16213e",
-                        font_color="#ccc", height=380,
-                        margin=dict(l=10, r=10, t=30, b=10),
-                        xaxis=dict(gridcolor="#0f3460"),
-                        yaxis=dict(gridcolor="#0f3460", tickformat=".0%"),
-                        legend=dict(bgcolor="#0f0c29", bordercolor="#0f3460", borderwidth=1),
-                        title=dict(text=f"{bt_ticker} — Strategy vs Buy & Hold", font_color="#ccc"),
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
+                            hist_bt["ret"]      = hist_bt["Close"].pct_change()
+                            hist_bt["strat"]    = hist_bt["signal"] * hist_bt["ret"]
+                            hist_bt["bah_cum"]  = (1 + hist_bt["ret"]).cumprod()
+                            hist_bt["strat_cum"]= (1 + hist_bt["strat"]).cumprod()
+                            hist_bt = hist_bt.dropna()
 
-                    st.caption("""
-**How it works:** SMA(20/50) crossover — buy when the 20-day moving average crosses above the 50-day, sell when it crosses below.
-This is a simple technical proxy, not the actual AI signal. For educational purposes only.
-""")
+                            # ── Stats ─────────────────────────────────────────
+                            bah_ret   = (hist_bt["bah_cum"].iloc[-1] - 1) * 100
+                            strat_ret = (hist_bt["strat_cum"].iloc[-1] - 1) * 100
+                            rolling_max = hist_bt["strat_cum"].cummax()
+                            max_dd      = ((hist_bt["strat_cum"] - rolling_max) / rolling_max).min() * 100
+                            q_invested  = int((signals_df["signal"] > 0).sum())
+
+                            m1, m2, m3, m4 = st.columns(4)
+                            strat_delta = f"{'▲' if strat_ret >= bah_ret else '▼'} vs Buy & Hold"
+                            m1.metric("AI Signal Return",   f"{strat_ret:+.1f}%", strat_delta)
+                            m2.metric("Buy & Hold Return",  f"{bah_ret:+.1f}%")
+                            m3.metric("Max Drawdown",       f"{max_dd:.1f}%")
+                            m4.metric("Quarters Invested",  f"{q_invested}")
+
+                            # ── Chart ─────────────────────────────────────────
+                            fig = go.Figure()
+                            # Shade bullish periods
+                            in_bull = False
+                            bull_start = None
+                            for idx, row in hist_bt.iterrows():
+                                if row["signal"] > 0 and not in_bull:
+                                    bull_start = idx
+                                    in_bull = True
+                                elif row["signal"] == 0 and in_bull:
+                                    fig.add_vrect(x0=bull_start, x1=idx,
+                                        fillcolor="rgba(0,230,118,0.07)", line_width=0)
+                                    in_bull = False
+                            if in_bull:
+                                fig.add_vrect(x0=bull_start, x1=hist_bt.index[-1],
+                                    fillcolor="rgba(0,230,118,0.07)", line_width=0)
+
+                            fig.add_trace(go.Scatter(
+                                x=hist_bt.index, y=hist_bt["bah_cum"],
+                                name="Buy & Hold", line=dict(color="#aaa", width=1.5, dash="dot"),
+                            ))
+                            fig.add_trace(go.Scatter(
+                                x=hist_bt.index, y=hist_bt["strat_cum"],
+                                name="AI Signal Strategy", line=dict(color="#00e676", width=2),
+                            ))
+                            fig.update_layout(
+                                paper_bgcolor="#16213e", plot_bgcolor="#16213e",
+                                font_color="#ccc", height=380,
+                                margin=dict(l=10, r=10, t=30, b=10),
+                                xaxis=dict(gridcolor="#0f3460"),
+                                yaxis=dict(gridcolor="#0f3460", tickformat=".0%"),
+                                legend=dict(bgcolor="#0f0c29", bordercolor="#0f3460", borderwidth=1),
+                                title=dict(text=f"{bt_ticker} — AI Signal vs Buy & Hold (🟢 = Bullish periods)", font_color="#ccc"),
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+
+                            # ── Quarterly signal table ────────────────────────
+                            with st.expander("📋 View quarterly signals"):
+                                display_df = signals_df[["revenue", "rev_growth", "signal"]].copy()
+                                display_df.index = display_df.index.strftime("%Y-Q%q") if hasattr(display_df.index, 'strftime') else display_df.index
+                                display_df["revenue"]    = display_df["revenue"].apply(lambda x: f"${x/1e9:.2f}B" if pd.notna(x) else "N/A")
+                                display_df["rev_growth"] = display_df["rev_growth"].apply(lambda x: f"{x*100:+.1f}%" if pd.notna(x) else "N/A")
+                                display_df["signal"]     = display_df["signal"].map({1: "🟢 BULLISH", 0.5: "🟡 NEUTRAL", 0: "🔴 BEARISH"})
+                                display_df.columns      = ["Revenue", "QoQ Growth", "Signal"]
+                                st.dataframe(display_df.tail(12), use_container_width=True)
+
             except Exception as e:
                 st.error(f"Backtest error: {e}")
 
