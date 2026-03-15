@@ -1,15 +1,23 @@
 import streamlit as st
 import requests
-from bs4 import BeautifulSoup
-from openai import OpenAI
-import json
-import yfinance as yf
-import plotly.graph_objects as go
 import pandas as pd
-import numpy as np
-import time
 
-# ── 1. App Configuration ──────────────────────────────────────────────────────
+from data import (
+    fetch_price_and_fundamentals,
+    fetch_chart_history,
+    fetch_news,
+    get_quarterly_income,
+)
+from ai import run_ai_debate, run_portfolio_analysis
+from ui import (
+    resolve_single, resolve_multi,
+    render_price_bar, render_fundamentals, render_candlestick_chart,
+    render_consensus, render_agent_cards, render_verdict,
+    render_share_button, render_backtest_chart,
+    signal_badge,
+)
+
+# ── 1. Page config ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="HaiInvestor", page_icon="👋", layout="wide")
 
 st.markdown("""
@@ -74,7 +82,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── 2. API Key ────────────────────────────────────────────────────────────────
+# ── 2. API key ─────────────────────────────────────────────────────────────────
 try:
     OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 except Exception:
@@ -97,319 +105,16 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ── 4. Language Selector ──────────────────────────────────────────────────────
+# ── 4. Language selector ───────────────────────────────────────────────────────
 col_lang = st.columns([3, 1])[1]
 with col_lang:
-    lang = st.radio("🌐 Language", ["English", "한국어"], horizontal=True, label_visibility="collapsed", key="lang_radio")
+    lang = st.radio("🌐 Language", ["English", "한국어"], horizontal=True,
+                    label_visibility="collapsed", key="lang_radio")
 LANG = lang
 
-# ── 5. Tabs ───────────────────────────────────────────────────────────────────
+# ── 5. Tabs ────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3 = st.tabs(["📊 Single Stock", "💼 Portfolio", "📈 Backtest"])
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def resolve_single(query, key_suffix=""):
-    """Resolve a company name or ticker string to a ticker symbol.
-    Shows a selectbox if multiple matches found. Returns ticker string or None."""
-    q = query.strip()
-    if not q:
-        return None
-    # Only skip search if the user explicitly typed an uppercase ticker (e.g. AAPL, BTC-USD)
-    if q == q.upper() and len(q) <= 8 and " " not in q:
-        return q.upper()
-    with st.spinner("Searching..."):
-        results = search_ticker(q)
-    if not results:
-        st.warning(f"No results found for '{q}'. Try a ticker symbol instead.")
-        return None
-    options = {f"{name} ({symbol})": symbol for symbol, name in results}
-    chosen  = st.selectbox("Select the stock you meant:", list(options.keys()), key=f"search_{key_suffix}")
-    if chosen:
-        ticker = options[chosen]
-        st.caption(f"✅ Resolved: **{ticker}**")
-        return ticker
-    return None
-
-def resolve_multi(raw_input):
-    """Resolve comma-separated company names/tickers to a list of ticker symbols.
-    Short tokens (<=6 chars, no spaces) are used directly.
-    Longer tokens are auto-resolved via Yahoo Finance (top result)."""
-    tokens  = [t.strip() for t in raw_input.split(",") if t.strip()]
-    tickers = []
-    for t in tokens:
-        if t == t.upper() and len(t) <= 8 and " " not in t:
-            tickers.append(t.upper())
-        else:
-            results = search_ticker(t)
-            if results:
-                tickers.append(results[0][0])  # take top result
-                st.caption(f"'{t}' → **{results[0][0]}** ({results[0][1]})")
-            else:
-                st.warning(f"Could not find ticker for '{t}', skipping.")
-    return tickers
-
-AGENTS_ORDER = [
-    ("Warren",  "👴", "Warren Buffett",  "Value Investor"),
-    ("Charlie", "🧠", "Charlie Munger",  "Mental Models"),
-    ("Michael", "🐻", "Michael Burry",   "Contrarian Bear"),
-    ("Peter",   "🏃", "Peter Lynch",     "GARP Investor"),
-    ("Cathie",  "🚀", "Cathie Wood",     "Innovation Bull"),
-    ("Bill",    "⚔️", "Bill Ackman",     "Activist Investor"),
-]
-
-def signal_badge(sig):
-    if sig == "BULLISH": return '<span class="badge badge-bull">▲ BULLISH</span>'
-    if sig == "BEARISH": return '<span class="badge badge-bear">▼ BEARISH</span>'
-    return '<span class="badge badge-neut">◆ NEUTRAL</span>'
-
-def signal_card_class(sig):
-    return {"BULLISH": "agent-card-bull", "BEARISH": "agent-card-bear"}.get(sig, "agent-card-neut")
-
-def signal_bar_class(sig):
-    return {"BULLISH": "conf-bar-fill-bull", "BEARISH": "conf-bar-fill-bear"}.get(sig, "conf-bar-fill-neut")
-
-def fmt_val(val, suffix="", multiplier=1, decimals=2):
-    if val is None or (isinstance(val, float) and np.isnan(val)):
-        return "N/A"
-    v = val * multiplier
-    if suffix == "" and abs(v) >= 1e12: return f"${v/1e12:.1f}T"
-    if suffix == "" and abs(v) >= 1e9:  return f"${v/1e9:.1f}B"
-    if suffix == "" and abs(v) >= 1e6:  return f"${v/1e6:.1f}M"
-    return f"{v:.{decimals}f}{suffix}"
-
-@st.cache_data(ttl=600)
-def fetch_price_and_fundamentals(ticker):
-    """Returns (price_dict, fundamentals_dict). Cached for 10 min.
-    Price uses fast_info (single light request).
-    Fundamentals use tkr.info (optional — all N/A on any failure).
-    Never raises for rate limits so @st.cache_data always caches the result."""
-    from yfinance.exceptions import YFRateLimitError
-    tkr = yf.Ticker(ticker)
-
-    # ── Price via fast_info (single lightweight API call) ────────────────
-    price = None
-    try:
-        fi  = tkr.fast_info
-        cur = fi.last_price
-        if cur:
-            price = {
-                "current": float(cur),
-                "prev":    float(fi.regular_market_previous_close or cur),
-                "high":    float(fi.day_high or cur),
-                "low":     float(fi.day_low or cur),
-            }
-            price["change"]     = price["current"] - price["prev"]
-            price["change_pct"] = price["change"] / price["prev"] * 100
-    except YFRateLimitError:
-        pass  # fall through to history fallback
-    except Exception:
-        pass  # fall through to history fallback
-
-    # ── Fallback: history() if fast_info gave nothing ────────────────────
-    if price is None:
-        for attempt in range(3):
-            try:
-                hist = tkr.history(period="5d")
-                if hist.empty:
-                    raise ValueError(f"No price data found for '{ticker}'")
-                price = {
-                    "current": float(hist["Close"].iloc[-1]),
-                    "prev":    float(hist["Close"].iloc[-2]) if len(hist) >= 2 else float(hist["Close"].iloc[-1]),
-                    "high":    float(hist["High"].iloc[-1]),
-                    "low":     float(hist["Low"].iloc[-1]),
-                }
-                price["change"]     = price["current"] - price["prev"]
-                price["change_pct"] = price["change"] / price["prev"] * 100
-                break
-            except YFRateLimitError:
-                if attempt < 2:
-                    time.sleep(3 ** attempt)
-                    continue
-                raise  # re-raise on last attempt so caller sees it
-            except Exception:
-                raise
-
-    # ── Fundamentals via tkr.info (completely optional) ───────────────────
-    fund_keys = ["Market Cap", "P/E (TTM)", "Forward P/E", "P/B Ratio",
-                 "Revenue Growth", "Profit Margin", "ROE", "Debt/Equity"]
-    try:
-        info = tkr.info
-        fund = {
-            "Market Cap":     fmt_val(info.get("marketCap")),
-            "P/E (TTM)":      fmt_val(info.get("trailingPE"),     decimals=1),
-            "Forward P/E":    fmt_val(info.get("forwardPE"),      decimals=1),
-            "P/B Ratio":      fmt_val(info.get("priceToBook"),    decimals=2),
-            "Revenue Growth": fmt_val(info.get("revenueGrowth"),  suffix="%", multiplier=100, decimals=1),
-            "Profit Margin":  fmt_val(info.get("profitMargins"),  suffix="%", multiplier=100, decimals=1),
-            "ROE":            fmt_val(info.get("returnOnEquity"), suffix="%", multiplier=100, decimals=1),
-            "Debt/Equity":    fmt_val(info.get("debtToEquity"),   decimals=2),
-        }
-    except Exception:
-        fund = {k: "N/A" for k in fund_keys}
-
-    return price, fund
-
-@st.cache_data(ttl=3600)
-def search_ticker(query):
-    """Search Yahoo Finance by company name or ticker. Returns list of (symbol, name)."""
-    try:
-        url  = f"https://query1.finance.yahoo.com/v1/finance/search?q={query}&newsCount=0&listsCount=0"
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-        data = resp.json()
-        results = []
-        for q in data.get("quotes", [])[:6]:
-            if q.get("quoteType") in ["EQUITY", "ETF", "CRYPTOCURRENCY"]:
-                symbol = q.get("symbol", "")
-                name   = q.get("shortname") or q.get("longname") or symbol
-                results.append((symbol, name))
-        return results
-    except Exception:
-        return []
-
-@st.cache_data(ttl=600)
-def fetch_chart_history(ticker, period="6mo"):
-    for attempt in range(3):
-        try:
-            return yf.Ticker(ticker).history(period=period)
-        except Exception as e:
-            if "429" in str(e) or "Too Many" in str(e) or "Rate" in str(e):
-                time.sleep(2 ** attempt)
-                continue
-            raise
-    return pd.DataFrame()
-
-@st.cache_data(ttl=300)
-def fetch_news(ticker):
-    url  = f"https://news.google.com/rss/search?q={ticker}+stock&hl=en-US&gl=US&ceid=US:en"
-    resp = requests.get(url, timeout=10)
-    soup = BeautifulSoup(resp.content, "html.parser")
-    items = soup.find_all("item")
-    return "\n".join(f"- {it.title.text}" for it in items[:10])
-
-def run_ai_debate(ticker, news_texts, fund, language="English"):
-    fund_text   = "Key financial data:\n" + "\n".join(
-        f"- {k}: {v}" for k, v in fund.items() if v != "N/A"
-    )
-    lang_instruction = (
-        "Write all reasoning, action, and rationale fields in Korean (한국어)."
-        if language == "한국어" else
-        "Write all reasoning, action, and rationale fields in English."
-    )
-    prompt = f"""
-You are simulating a live investment committee debate about '{ticker}'.
-Latest news headlines:
-{news_texts}
-
-{fund_text}
-
-{lang_instruction}
-
-Return ONLY a valid JSON object with this exact structure (no extra text):
-{{
-  "Warren":  {{"signal": "BULLISH|BEARISH|NEUTRAL", "confidence": <1-100>, "reasoning": "<2-3 sentences from Warren Buffett's value-investing perspective>"}},
-  "Charlie": {{"signal": "BULLISH|BEARISH|NEUTRAL", "confidence": <1-100>, "reasoning": "<2-3 sentences from Charlie Munger's mental-models perspective>"}},
-  "Michael": {{"signal": "BULLISH|BEARISH|NEUTRAL", "confidence": <1-100>, "reasoning": "<2-3 sentences from Michael Burry's contrarian macro perspective>"}},
-  "Peter":   {{"signal": "BULLISH|BEARISH|NEUTRAL", "confidence": <1-100>, "reasoning": "<2-3 sentences from Peter Lynch's GARP perspective>"}},
-  "Cathie":  {{"signal": "BULLISH|BEARISH|NEUTRAL", "confidence": <1-100>, "reasoning": "<2-3 sentences from Cathie Wood's disruptive-technology perspective>"}},
-  "Bill":    {{"signal": "BULLISH|BEARISH|NEUTRAL", "confidence": <1-100>, "reasoning": "<2-3 sentences from Bill Ackman's activist-investor perspective>"}},
-  "Manager": {{"verdict": "BUY|SELL|HOLD", "confidence": <1-100>, "action": "<One concrete actionable sentence>", "rationale": "<2-3 sentences synthesizing the panel's views>"}}
-}}
-"""
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    resp   = client.chat.completions.create(
-        model="gpt-4o-mini",
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": "You are a multi-agent hedge fund simulator. Output only valid JSON."},
-            {"role": "user",   "content": prompt},
-        ],
-    )
-    return json.loads(resp.choices[0].message.content)
-
-def render_price_bar(ticker, price):
-    d_class = "price-up" if price["change"] >= 0 else "price-down"
-    d_sign  = "▲" if price["change"] >= 0 else "▼"
-    st.markdown(f"""
-<div class="price-bar">
-    <span class="price-ticker">{ticker}</span>
-    <span class="price-value">${price['current']:,.2f}</span>
-    <span class="{d_class}">{d_sign} {abs(price['change']):.2f} ({abs(price['change_pct']):.2f}%)</span>
-    <span class="price-meta">Day: ${price['low']:,.2f} – ${price['high']:,.2f}</span>
-</div>""", unsafe_allow_html=True)
-
-def render_fundamentals(fund):
-    html = "<div style='display:flex; flex-wrap:wrap; gap:10px; margin-bottom:20px;'>"
-    for label, value in fund.items():
-        if value == "N/A": continue
-        html += f"""<div style='background:#1a1a2e; border-radius:10px; padding:12px 18px; min-width:110px;'>
-            <div style='color:#aaa; font-size:0.72rem; margin-bottom:4px;'>{label}</div>
-            <div style='color:#fff; font-size:1rem; font-weight:700;'>{value}</div></div>"""
-    html += "</div>"
-    st.markdown(html, unsafe_allow_html=True)
-
-def render_consensus(ticker, result):
-    signals  = [result[k]["signal"] for k, *_ in AGENTS_ORDER if k in result]
-    bull_n   = signals.count("BULLISH")
-    bear_n   = signals.count("BEARISH")
-    neut_n   = signals.count("NEUTRAL")
-    total    = len(signals) or 1
-    bull_pct = int(bull_n / total * 100)
-    bear_pct = int(bear_n / total * 100)
-    neut_pct = int(neut_n / total * 100)
-    st.markdown(f"""
-<div class="consensus-box">
-    <div class="consensus-title">⚖️ PANEL CONSENSUS — {ticker}</div>
-    <div style="display:flex; gap:24px; margin-bottom:12px;">
-        <span>{signal_badge('BULLISH')} &nbsp;<b style="color:#fff">{bull_n}</b><span style="color:#aaa"> / {total}</span></span>
-        <span>{signal_badge('BEARISH')} &nbsp;<b style="color:#fff">{bear_n}</b><span style="color:#aaa"> / {total}</span></span>
-        <span>{signal_badge('NEUTRAL')} &nbsp;<b style="color:#fff">{neut_n}</b><span style="color:#aaa"> / {total}</span></span>
-    </div>
-    <div style="display:flex; height:10px; border-radius:6px; overflow:hidden; background:#0a0a1a;">
-        <div style="width:{bull_pct}%; background:#00e676;"></div>
-        <div style="width:{neut_pct}%; background:#ffd740;"></div>
-        <div style="width:{bear_pct}%; background:#ff5252;"></div>
-    </div>
-    <div style="display:flex; justify-content:space-between; margin-top:4px;">
-        <span style="color:#00e676; font-size:0.75rem;">{bull_pct}% Bullish</span>
-        <span style="color:#ffd740; font-size:0.75rem;">{neut_pct}% Neutral</span>
-        <span style="color:#ff5252; font-size:0.75rem;">{bear_pct}% Bearish</span>
-    </div>
-</div>""", unsafe_allow_html=True)
-
-def render_agent_cards(result):
-    st.markdown("### 🗣️ Investor Perspectives")
-    col_l, col_r = st.columns(2)
-    for i, (key, icon, name, role) in enumerate(AGENTS_ORDER):
-        data = result.get(key, {})
-        sig  = data.get("signal", "NEUTRAL")
-        conf = data.get("confidence", 50)
-        text = data.get("reasoning", "")
-        html = f"""<div class="agent-card {signal_card_class(sig)}">
-    <div class="agent-name">{icon} {name} <span style="color:#aaa; font-weight:400; font-size:0.8rem;">· {role}</span></div>
-    {signal_badge(sig)}
-    <div class="conf-bar-bg"><div class="{signal_bar_class(sig)}" style="width:{conf}%;"></div></div>
-    <div class="agent-conf">Conviction: {conf}%</div>
-    <div class="agent-text">{text}</div>
-</div>"""
-        (col_l if i % 2 == 0 else col_r).markdown(html, unsafe_allow_html=True)
-
-def render_verdict(result):
-    st.markdown("### 🏦 Portfolio Manager's Final Verdict")
-    mgr       = result.get("Manager", {})
-    verdict   = mgr.get("verdict", "HOLD")
-    m_conf    = mgr.get("confidence", 50)
-    action    = mgr.get("action", "")
-    rationale = mgr.get("rationale", "")
-    v_class   = {"BUY": "verdict-buy",       "SELL": "verdict-sell"      }.get(verdict, "verdict-hold")
-    l_class   = {"BUY": "verdict-label-buy", "SELL": "verdict-label-sell"}.get(verdict, "verdict-label-hold")
-    v_icon    = {"BUY": "📗", "SELL": "📕"}.get(verdict, "📒")
-    st.markdown(f"""<div class="{v_class}">
-    <div class="verdict-label {l_class}">{v_icon} {verdict}</div>
-    <div class="verdict-sub"><b>{action}</b><br><br>{rationale}</div>
-    <div class="verdict-conf">Portfolio Manager Conviction: {m_conf}%</div>
-</div>""", unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — SINGLE STOCK
@@ -439,6 +144,7 @@ Pick any stock and let 6 legendary AI investors debate it using real news and fi
 
 > ⚠️ This is AI-generated analysis for educational purposes only. Always make your own investment decisions.
 """)
+
     st.markdown("#### 🔥 Popular Stocks")
     c1, c2, c3, c4, c5 = st.columns(5)
     target_ticker = None
@@ -449,7 +155,8 @@ Pick any stock and let 6 legendary AI investors debate it using real news and fi
     if c5.button("📦 AMZN", use_container_width=True): target_ticker = "AMZN"
 
     st.markdown("<br>", unsafe_allow_html=True)
-    custom = st.text_input("🔍 Search by ticker or company name", placeholder="e.g., Apple, NVDA, Tesla, Bitcoin", key="single_input")
+    custom = st.text_input("🔍 Search by ticker or company name",
+                           placeholder="e.g., Apple, NVDA, Tesla, Bitcoin", key="single_input")
     if custom:
         target_ticker = resolve_single(custom, key_suffix="single")
 
@@ -464,27 +171,8 @@ Pick any stock and let 6 legendary AI investors debate it using real news and fi
 
         render_price_bar(target_ticker, price)
 
-        # ── Chart ────────────────────────────────────────────────────────────
         try:
-            hist_6m = fetch_chart_history(target_ticker, "6mo")
-            if not hist_6m.empty:
-                fig = go.Figure()
-                fig.add_trace(go.Candlestick(
-                    x=hist_6m.index,
-                    open=hist_6m["Open"], high=hist_6m["High"],
-                    low=hist_6m["Low"],   close=hist_6m["Close"],
-                    increasing_line_color="#00e676", decreasing_line_color="#ff5252",
-                    name="Price",
-                ))
-                fig.update_layout(
-                    paper_bgcolor="#16213e", plot_bgcolor="#16213e",
-                    font_color="#ccc", height=320,
-                    margin=dict(l=10, r=10, t=10, b=10),
-                    xaxis=dict(gridcolor="#0f3460", showgrid=True, rangeslider_visible=False),
-                    yaxis=dict(gridcolor="#0f3460", showgrid=True),
-                    showlegend=False,
-                )
-                st.plotly_chart(fig, use_container_width=True)
+            render_candlestick_chart(fetch_chart_history(target_ticker, "6mo"))
         except Exception:
             pass
 
@@ -493,12 +181,11 @@ Pick any stock and let 6 legendary AI investors debate it using real news and fi
         with st.spinner("Convening the AI Hedge Fund Panel... ⏳"):
             try:
                 news   = fetch_news(target_ticker)
-                result = run_ai_debate(target_ticker, news, fund, LANG)
+                result = run_ai_debate(target_ticker, news, fund, OPENAI_API_KEY, LANG)
                 render_consensus(target_ticker, result)
                 render_agent_cards(result)
                 render_verdict(result)
 
-                # ── Share button ─────────────────────────────────────────────
                 mgr     = result.get("Manager", {})
                 verdict = mgr.get("verdict", "HOLD")
                 v_emoji = {"BUY": "📗", "SELL": "📕"}.get(verdict, "📒")
@@ -507,21 +194,13 @@ Pick any stock and let 6 legendary AI investors debate it using real news and fi
                     f"Verdict: {v_emoji} {verdict}\n\n"
                     f"Try it yourself 👇\nhttps://ainvest-jnpzmtom62rulztvu24d6c.streamlit.app"
                 )
-                tweet_url = f"https://twitter.com/intent/tweet?text={requests.utils.quote(tweet)}"
-                st.markdown(f"""
-<div style="text-align:center; margin-top:24px;">
-    <a href="{tweet_url}" target="_blank"
-       style="background:#1DA1F2; color:white; padding:10px 24px; border-radius:20px;
-              text-decoration:none; font-weight:700; font-size:0.9rem;">
-        🐦 Share on X (Twitter)
-    </a>
-</div>
-""", unsafe_allow_html=True)
+                render_share_button(tweet)
             except Exception as e:
                 st.error(f"An error occurred: {e}")
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — PORTFOLIO MODE
+# TAB 2 — PORTFOLIO
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab2:
     st.markdown("### 💼 Portfolio Analyzer")
@@ -552,7 +231,7 @@ Enter several stocks at once and the AI will analyze each one, then suggest how 
     portfolio_input = st.text_input(
         "Enter tickers or company names, separated by commas",
         placeholder="e.g., Apple, NVDA, Tesla, Microsoft",
-        key="portfolio_input"
+        key="portfolio_input",
     )
 
     if st.button("🚀 Analyze Portfolio", use_container_width=True, key="portfolio_btn"):
@@ -566,30 +245,11 @@ Enter several stocks at once and the AI will analyze each one, then suggest how 
             progress = st.progress(0, text="Analyzing...")
 
             for i, ticker in enumerate(tickers):
-                progress.progress((i) / len(tickers), text=f"Analyzing {ticker}...")
+                progress.progress(i / len(tickers), text=f"Analyzing {ticker}...")
                 try:
                     price, fund = fetch_price_and_fundamentals(ticker)
-                    news = fetch_news(ticker)
-                    # Lightweight single-signal prompt
-                    fund_text   = "\n".join(f"- {k}: {v}" for k, v in fund.items() if v != "N/A")
-                    lang_note   = "Write the summary field in Korean (한국어)." if LANG == "한국어" else "Write the summary field in English."
-                    prompt = f"""
-Analyze '{ticker}' as a portfolio manager.
-News: {news[:500]}
-Financials: {fund_text}
-{lang_note}
-Return JSON: {{"signal": "BULLISH|BEARISH|NEUTRAL", "confidence": <1-100>, "summary": "<1 sentence rationale>", "verdict": "BUY|SELL|HOLD"}}
-"""
-                    client = OpenAI(api_key=OPENAI_API_KEY)
-                    resp   = client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        response_format={"type": "json_object"},
-                        messages=[
-                            {"role": "system", "content": "Portfolio analysis. Output only valid JSON."},
-                            {"role": "user",   "content": prompt},
-                        ],
-                    )
-                    ai = json.loads(resp.choices[0].message.content)
+                    news        = fetch_news(ticker)
+                    ai          = run_portfolio_analysis(ticker, news, fund, OPENAI_API_KEY, LANG)
                     results_list.append({
                         "ticker":     ticker,
                         "price":      price["current"],
@@ -611,24 +271,24 @@ Return JSON: {{"signal": "BULLISH|BEARISH|NEUTRAL", "confidence": <1-100>, "summ
 
             progress.empty()
 
-            # ── Suggested weights (based on bullish conviction only) ──────────
+            # Suggested weights (bullish conviction only)
             bull_stocks = [r for r in results_list if r["signal"] == "BULLISH"]
             total_conf  = sum(r["confidence"] for r in bull_stocks) or 1
             for r in results_list:
                 r["weight"] = f"{int(r['confidence'] / total_conf * 100)}%" if r["signal"] == "BULLISH" else "—"
 
-            # ── Display table ────────────────────────────────────────────────
+            # Results table
             st.markdown("#### 📋 Portfolio Summary")
             for r in results_list:
-                sig   = r["signal"]
-                chg   = r["change_pct"]
-                chg_c = "#00e676" if chg >= 0 else "#ff5252"
-                chg_s = f"▲ {abs(chg):.1f}%" if chg >= 0 else f"▼ {abs(chg):.1f}%"
+                sig     = r["signal"]
+                chg     = r["change_pct"]
+                chg_c   = "#00e676" if chg >= 0 else "#ff5252"
+                chg_s   = f"▲ {abs(chg):.1f}%" if chg >= 0 else f"▼ {abs(chg):.1f}%"
                 v_color = {"BUY": "#00e676", "SELL": "#ff5252"}.get(r["verdict"], "#ffd740")
-
+                border  = "#00e676" if sig == "BULLISH" else "#ff5252" if sig == "BEARISH" else "#ffd740"
                 st.markdown(f"""
 <div style="background:#16213e; border-radius:12px; padding:16px 20px; margin-bottom:12px;
-            border-left:4px solid {'#00e676' if sig=='BULLISH' else '#ff5252' if sig=='BEARISH' else '#ffd740'};">
+            border-left:4px solid {border};">
   <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
     <div>
       <span style="color:#fff; font-size:1.1rem; font-weight:800;">{r['ticker']}</span>
@@ -646,7 +306,8 @@ Return JSON: {{"signal": "BULLISH|BEARISH|NEUTRAL", "confidence": <1-100>, "summ
   <div style="color:#666; font-size:0.75rem; margin-top:4px;">Market Cap: {r['mktcap']} &nbsp;|&nbsp; P/E: {r['pe']}</div>
 </div>""", unsafe_allow_html=True)
 
-            # ── Pie chart of suggested weights ───────────────────────────────
+            # Pie chart
+            import plotly.graph_objects as go
             bull_for_pie = [r for r in results_list if r["signal"] == "BULLISH"]
             if bull_for_pie:
                 st.markdown("#### 🥧 Suggested Allocation (Bullish Only)")
@@ -665,7 +326,6 @@ Return JSON: {{"signal": "BULLISH|BEARISH|NEUTRAL", "confidence": <1-100>, "summ
             else:
                 st.info("No BULLISH signals — consider waiting for a better entry point.")
 
-            # ── Share button ─────────────────────────────────────────────────
             ticker_list = ", ".join(f"${r['ticker']}" for r in results_list)
             buy_list    = ", ".join(f"${r['ticker']}" for r in results_list if r["verdict"] == "BUY") or "none"
             tweet = (
@@ -674,16 +334,8 @@ Return JSON: {{"signal": "BULLISH|BEARISH|NEUTRAL", "confidence": <1-100>, "summ
                 f"AI says BUY: {buy_list}\n\n"
                 f"Try it yourself 👇\nhttps://ainvest-jnpzmtom62rulztvu24d6c.streamlit.app"
             )
-            tweet_url = f"https://twitter.com/intent/tweet?text={requests.utils.quote(tweet)}"
-            st.markdown(f"""
-<div style="text-align:center; margin-top:24px;">
-    <a href="{tweet_url}" target="_blank"
-       style="background:#1DA1F2; color:white; padding:10px 24px; border-radius:20px;
-              text-decoration:none; font-weight:700; font-size:0.9rem;">
-        🐦 Share on X (Twitter)
-    </a>
-</div>
-""", unsafe_allow_html=True)
+            render_share_button(tweet)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — BACKTEST
@@ -726,7 +378,8 @@ Each quarter, we check two things Warren Buffett, Peter Lynch, and others actual
 
     bt_col1, bt_col2, bt_col3 = st.columns([2, 1, 1])
     with bt_col1:
-        bt_input = st.text_input("Ticker or company name", placeholder="e.g., NVDA, Apple, Tesla", key="bt_input")
+        bt_input = st.text_input("Ticker or company name",
+                                 placeholder="e.g., NVDA, Apple, Tesla", key="bt_input")
     with bt_col2:
         bt_period = st.selectbox("Period", ["1y", "2y", "5y"], index=1)
     with bt_col3:
@@ -738,68 +391,54 @@ Each quarter, we check two things Warren Buffett, Peter Lynch, and others actual
     if run_bt and bt_ticker:
         with st.spinner("Running backtest..."):
             try:
-                tkr_bt = yf.Ticker(bt_ticker)
-
-                # ── Get quarterly financials ──────────────────────────────────
-                @st.cache_data(ttl=3600)
-                def get_quarterly_income(t):
-                    return yf.Ticker(t).quarterly_income_stmt
-
                 income = get_quarterly_income(bt_ticker)
                 if income is None or income.empty:
                     st.error("No quarterly financial data available for this ticker.")
                 else:
-                    # Revenue and net income rows
                     rev_row = next((r for r in ["Total Revenue", "Revenue"] if r in income.index), None)
                     inc_row = next((r for r in ["Net Income", "Net Income Common Stockholders"] if r in income.index), None)
 
                     if not rev_row:
                         st.error("Revenue data not available for this ticker.")
                     else:
-                        rev = income.loc[rev_row].sort_index()           # oldest → newest
+                        rev = income.loc[rev_row].sort_index()
                         net = income.loc[inc_row].sort_index() if inc_row else None
 
-                        # Build quarterly signal DataFrame
                         signals_df = pd.DataFrame({"revenue": rev})
                         signals_df["rev_growth"] = signals_df["revenue"].pct_change()
                         if net is not None:
                             signals_df["profitable"] = net.reindex(signals_df.index) > 0
                         else:
-                            signals_df["profitable"] = True  # assume if unknown
+                            signals_df["profitable"] = True
 
                         def quarter_signal(row):
                             if pd.isna(row["rev_growth"]): return 0
                             growing    = row["rev_growth"] > 0
                             profitable = row.get("profitable", True)
-                            if growing and profitable:   return 1   # BULLISH
-                            if not growing:              return 0   # BEARISH
-                            return 0.5                              # NEUTRAL → half position
+                            if growing and profitable: return 1
+                            if not growing:            return 0
+                            return 0.5
 
                         signals_df["signal"] = signals_df.apply(quarter_signal, axis=1)
-                        # Shift by 1 quarter: we act on the quarter AFTER we see the data
                         signals_df["signal"] = signals_df["signal"].shift(1).fillna(0)
 
-                        # ── Get daily price history ───────────────────────────
                         hist_bt = fetch_chart_history(bt_ticker, bt_period)[["Close"]].copy()
                         if hist_bt.empty or len(hist_bt) < 20:
                             st.error("Not enough price history.")
                         else:
-                            # Map quarterly signal to daily
                             hist_bt.index = hist_bt.index.tz_localize(None)
                             signals_df.index = pd.to_datetime(signals_df.index).tz_localize(None)
 
                             hist_bt["signal"] = 0.0
                             for date, sig in signals_df["signal"].items():
-                                mask = hist_bt.index >= date
-                                hist_bt.loc[mask, "signal"] = sig
+                                hist_bt.loc[hist_bt.index >= date, "signal"] = sig
 
-                            hist_bt["ret"]      = hist_bt["Close"].pct_change()
-                            hist_bt["strat"]    = hist_bt["signal"] * hist_bt["ret"]
-                            hist_bt["bah_cum"]  = (1 + hist_bt["ret"]).cumprod()
-                            hist_bt["strat_cum"]= (1 + hist_bt["strat"]).cumprod()
+                            hist_bt["ret"]       = hist_bt["Close"].pct_change()
+                            hist_bt["strat"]     = hist_bt["signal"] * hist_bt["ret"]
+                            hist_bt["bah_cum"]   = (1 + hist_bt["ret"]).cumprod()
+                            hist_bt["strat_cum"] = (1 + hist_bt["strat"]).cumprod()
                             hist_bt = hist_bt.dropna()
 
-                            # ── Stats ─────────────────────────────────────────
                             bah_ret   = (hist_bt["bah_cum"].iloc[-1] - 1) * 100
                             strat_ret = (hist_bt["strat_cum"].iloc[-1] - 1) * 100
                             rolling_max = hist_bt["strat_cum"].cummax()
@@ -808,61 +447,33 @@ Each quarter, we check two things Warren Buffett, Peter Lynch, and others actual
 
                             m1, m2, m3, m4 = st.columns(4)
                             strat_delta = f"{'▲' if strat_ret >= bah_ret else '▼'} vs Buy & Hold"
-                            m1.metric("AI Signal Return",   f"{strat_ret:+.1f}%", strat_delta)
-                            m2.metric("Buy & Hold Return",  f"{bah_ret:+.1f}%")
-                            m3.metric("Max Drawdown",       f"{max_dd:.1f}%")
-                            m4.metric("Quarters Invested",  f"{q_invested}")
+                            m1.metric("AI Signal Return",  f"{strat_ret:+.1f}%", strat_delta)
+                            m2.metric("Buy & Hold Return", f"{bah_ret:+.1f}%")
+                            m3.metric("Max Drawdown",      f"{max_dd:.1f}%")
+                            m4.metric("Quarters Invested", f"{q_invested}")
 
-                            # ── Chart ─────────────────────────────────────────
-                            fig = go.Figure()
-                            # Shade bullish periods
-                            in_bull = False
-                            bull_start = None
-                            for idx, row in hist_bt.iterrows():
-                                if row["signal"] > 0 and not in_bull:
-                                    bull_start = idx
-                                    in_bull = True
-                                elif row["signal"] == 0 and in_bull:
-                                    fig.add_vrect(x0=bull_start, x1=idx,
-                                        fillcolor="rgba(0,230,118,0.07)", line_width=0)
-                                    in_bull = False
-                            if in_bull:
-                                fig.add_vrect(x0=bull_start, x1=hist_bt.index[-1],
-                                    fillcolor="rgba(0,230,118,0.07)", line_width=0)
+                            render_backtest_chart(hist_bt, bt_ticker)
 
-                            fig.add_trace(go.Scatter(
-                                x=hist_bt.index, y=hist_bt["bah_cum"],
-                                name="Buy & Hold", line=dict(color="#aaa", width=1.5, dash="dot"),
-                            ))
-                            fig.add_trace(go.Scatter(
-                                x=hist_bt.index, y=hist_bt["strat_cum"],
-                                name="AI Signal Strategy", line=dict(color="#00e676", width=2),
-                            ))
-                            fig.update_layout(
-                                paper_bgcolor="#16213e", plot_bgcolor="#16213e",
-                                font_color="#ccc", height=380,
-                                margin=dict(l=10, r=10, t=30, b=10),
-                                xaxis=dict(gridcolor="#0f3460"),
-                                yaxis=dict(gridcolor="#0f3460", tickformat=".0%"),
-                                legend=dict(bgcolor="#0f0c29", bordercolor="#0f3460", borderwidth=1),
-                                title=dict(text=f"{bt_ticker} — AI Signal vs Buy & Hold (🟢 = Bullish periods)", font_color="#ccc"),
-                            )
-                            st.plotly_chart(fig, use_container_width=True)
-
-                            # ── Quarterly signal table ────────────────────────
                             with st.expander("📋 View quarterly signals"):
                                 display_df = signals_df[["revenue", "rev_growth", "signal"]].copy()
-                                display_df.index = display_df.index.strftime("%Y-Q%q") if hasattr(display_df.index, 'strftime') else display_df.index
-                                display_df["revenue"]    = display_df["revenue"].apply(lambda x: f"${x/1e9:.2f}B" if pd.notna(x) else "N/A")
-                                display_df["rev_growth"] = display_df["rev_growth"].apply(lambda x: f"{x*100:+.1f}%" if pd.notna(x) else "N/A")
-                                display_df["signal"]     = display_df["signal"].map({1: "🟢 BULLISH", 0.5: "🟡 NEUTRAL", 0: "🔴 BEARISH"})
-                                display_df.columns      = ["Revenue", "QoQ Growth", "Signal"]
+                                display_df.index = (
+                                    display_df.index.strftime("%Y-Q%q")
+                                    if hasattr(display_df.index, "strftime") else display_df.index
+                                )
+                                display_df["revenue"]    = display_df["revenue"].apply(
+                                    lambda x: f"${x/1e9:.2f}B" if pd.notna(x) else "N/A")
+                                display_df["rev_growth"] = display_df["rev_growth"].apply(
+                                    lambda x: f"{x*100:+.1f}%" if pd.notna(x) else "N/A")
+                                display_df["signal"]     = display_df["signal"].map(
+                                    {1: "🟢 BULLISH", 0.5: "🟡 NEUTRAL", 0: "🔴 BEARISH"})
+                                display_df.columns = ["Revenue", "QoQ Growth", "Signal"]
                                 st.dataframe(display_df.tail(12), use_container_width=True)
 
             except Exception as e:
                 st.error(f"Backtest error: {e}")
 
-# ── Footer ────────────────────────────────────────────────────────────────────
+
+# ── Footer ─────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="disclaimer">
     ⚠️ <b>Disclaimer:</b> This AI analysis is a simulation based on public news and financial data.
@@ -887,4 +498,5 @@ with st.expander("😤 Hate this app?", expanded=False):
         "Think our AI panel is full of garbage? **Pay $1 and leave your best insult in the PayPal note.** I'll read every single one.",
         unsafe_allow_html=False
     )
-    st.link_button("💸 Pay $1 to Insult Me", "https://www.paypal.com/ncp/payment/A3Q3JEV6WRXSG", use_container_width=False)
+    st.link_button("💸 Pay $1 to Insult Me", "https://www.paypal.com/ncp/payment/A3Q3JEV6WRXSG",
+                   use_container_width=False)
