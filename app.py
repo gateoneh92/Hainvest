@@ -158,16 +158,23 @@ if target_ticker:
     # ── 5a. Live Price Data ──────────────────────────────────────────────────
     price_html = ""
     try:
-        tkr = yf.Ticker(target_ticker)
-        info = tkr.fast_info
-        current_price = info.last_price
-        prev_close    = info.previous_close
+        tkr  = yf.Ticker(target_ticker)
+        hist = tkr.history(period="5d")
+        if hist.empty:
+            raise ValueError("empty")
+
+        current_price = float(hist["Close"].iloc[-1])
+        prev_close    = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else current_price
+        day_high      = float(hist["High"].iloc[-1])
+        day_low       = float(hist["Low"].iloc[-1])
         change        = current_price - prev_close
         change_pct    = (change / prev_close) * 100
-        day_high      = info.day_high
-        day_low       = info.day_low
-        year_high     = info.year_high
-        year_low      = info.year_low
+
+        # 52-week range from 1y history
+        hist_1y   = tkr.history(period="1y")
+        year_high = float(hist_1y["High"].max()) if not hist_1y.empty else None
+        year_low  = float(hist_1y["Low"].min())  if not hist_1y.empty else None
+        year_str  = f"52W: ${year_low:,.2f} – ${year_high:,.2f}" if year_high else ""
 
         direction_class = "price-up" if change >= 0 else "price-down"
         direction_sign  = "▲" if change >= 0 else "▼"
@@ -177,7 +184,7 @@ if target_ticker:
             <span class="price-ticker">{target_ticker}</span>
             <span class="price-value">${current_price:,.2f}</span>
             <span class="{direction_class}">{direction_sign} {abs(change):.2f} ({abs(change_pct):.2f}%)</span>
-            <span class="price-meta">Day: ${day_low:,.2f} – ${day_high:,.2f} &nbsp;|&nbsp; 52W: ${year_low:,.2f} – ${year_high:,.2f}</span>
+            <span class="price-meta">Day: ${day_low:,.2f} – ${day_high:,.2f} &nbsp;|&nbsp; {year_str}</span>
         </div>
         """
     except Exception:
@@ -336,9 +343,15 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-st.markdown("""
-<div style='text-align:center; margin-top:20px;'>
-    <img src="https://hits.seeyoufarm.com/api/count/incr/badge.svg?url=https%3A%2F%2Fainvest-jnpzmtom62rulztvu24d6c.streamlit.app&count_bg=%230079C1&title_bg=%23303030&icon=eye.svg&icon_color=%23FFFFFF&title=Today&edge_flat=true" alt="visitor count"/>
+try:
+    r = requests.get("https://api.counterapi.dev/v1/hainvestor/visits/up", timeout=3)
+    count = r.json().get("count", "—")
+except Exception:
+    count = "—"
+
+st.markdown(f"""
+<div style='text-align:center; margin:16px 0 8px; color:#aaa; font-size:0.85rem;'>
+    👁️ Total Visitors &nbsp;<span style='color:#fff; font-weight:700; font-size:1rem;'>{count}</span>
 </div>
 """, unsafe_allow_html=True)
 
